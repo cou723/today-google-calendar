@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  myapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: today-calendar-viewer-builder
+    volumes:
+      - .:/usr/src/myapp
+      - ./target:/usr/src/myapp/target
+    command: ["cargo", "build", "--target=aarch64-unknown-linux-gnu", "--release"]
