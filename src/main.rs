@@ -5,7 +5,9 @@ use std::{env, io, time::Duration};
 
 use anyhow::Result;
 use calendar::Calendar;
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Utc};
+use chrono_tz::Asia::Tokyo;
+use chrono_tz::Tz;
 use event::{EventModel, EventView};
 use oauth2::basic::{BasicErrorResponseType, BasicTokenType};
 use oauth2::url::Url;
@@ -26,7 +28,7 @@ use token::Token;
 struct App {
     events: Option<Vec<EventModel>>,
     token: Token,
-    current_date: NaiveDate,
+    current_date: DateTime<Tz>,
 }
 
 type OAuthClient = oauth2::Client<
@@ -43,57 +45,33 @@ type OAuthClient = oauth2::Client<
 >;
 
 impl App {
-    fn new(client_id: String, client_secret: String) -> Result<Self> {
-        let jst = FixedOffset::east_opt(9 * 3600).expect("Failed to create JST offset");
-        let now_jst: DateTime<FixedOffset> = Utc::now().with_timezone(&jst);
-        let today_jst = now_jst.date_naive();
-
+    fn new(client_id: String, client_secret: String, now: DateTime<Tz>) -> Result<Self> {
         Ok(App {
             events: None,
             token: Token::new(client_id, client_secret)?,
-            current_date: today_jst,
+            current_date: now,
         })
     }
 
-    fn get_date_range(date: NaiveDate) -> Result<(String, String)> {
-        let jst = FixedOffset::east_opt(9 * 3600).expect("Failed to create JST offset");
-
-        let time_min_jst = match date
-            .and_hms_opt(0, 0, 0)
-            .expect("Failed to create time_min_jst")
-            .and_local_timezone(jst)
-        {
-            chrono::offset::LocalResult::Ambiguous(x, _) => x,
-            chrono::offset::LocalResult::Single(x) => x,
-            chrono::offset::LocalResult::None => panic!("Failed to create time_min_jst"),
-        };
-
-        let time_min_utc = time_min_jst.with_timezone(&Utc);
-        let time_min = time_min_utc.to_rfc3339();
-
-        let time_max_jst = match date
-            .and_hms_opt(23, 59, 59)
-            .expect("Failed to create time_max_jst")
-            .and_local_timezone(jst)
-        {
-            chrono::offset::LocalResult::Ambiguous(x, _) => x,
-            chrono::offset::LocalResult::Single(x) => x,
-            chrono::offset::LocalResult::None => panic!("Failed to create time_max_jst"),
-        };
-
-        let time_max_utc = time_max_jst.with_timezone(&Utc);
-        let time_max = time_max_utc.to_rfc3339();
-        return Ok((time_min, time_max));
+    fn get_utc_date_range_string(date: DateTime<Tz>) -> Result<(String, String)> {
+        return Ok((
+            date.with_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                .unwrap()
+                .to_rfc3339(),
+            date.with_time(chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap())
+                .unwrap()
+                .to_rfc3339(),
+        ));
     }
 
     fn fetch_date_events(
         self: &Self,
-        date: NaiveDate,
+        date: DateTime<Tz>,
         display_calendar_list: Vec<Calendar>,
     ) -> Result<Vec<EventModel>> {
         let client = Client::new();
 
-        let (time_min, time_max) = App::get_date_range(date)?;
+        let (time_min, time_max) = App::get_utc_date_range_string(date)?;
 
         println!("Fetching events for date: {}", date);
         println!("Time Min (UTC): {}", time_min);
@@ -146,59 +124,64 @@ impl App {
             .collect::<Vec<EventModel>>())
     }
 
-    fn fetch_today_events(
-        self: &Self,
-        display_calendar_list: Vec<Calendar>,
-    ) -> Result<Vec<EventModel>> {
-        let jst = FixedOffset::east_opt(9 * 3600).expect("Failed to create JST offset");
-        let now_jst: DateTime<FixedOffset> = Utc::now().with_timezone(&jst);
-        let today_jst = now_jst.date_naive();
-
-        self.fetch_date_events(today_jst, display_calendar_list)
-    }
 
     fn render_ui(
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         events: Vec<EventView>,
+        now: DateTime<Tz>,
     ) -> Result<()> {
         terminal.clear()?;
         terminal.draw(|terminal_window| {
-            let height_unit = terminal_window.area().height as f64 / 24 as f64;
+            // render events
+            let height_unit: u16 = terminal_window.area().height / 48;
             for event in events {
                 let size = Rect {
-                    x: terminal_window.area().x,
-                    y: (event.start as f64 * height_unit) as u16,
-                    width: terminal_window.area().width,
-                    height: (event.height * height_unit) as u16,
+                    x: 1 + terminal_window.area().x,
+                    y: event.start * height_unit,
+                    width: terminal_window.area().width - 1,
+                    height: event.height * height_unit,
                 };
 
                 terminal_window.render_widget(
                     Paragraph::new(event.title).block(
                         Block::default()
-                            .borders(Borders::ALL)
+                            .borders(Borders::NONE)
                             .style(Style::default().bg(event.color)),
                     ),
                     size,
                 );
             }
+            // render now line
+            let now_height = EventView::date_time_to_height(now, &Tokyo);
+            let size = Rect {
+                x: 0,
+                y: now_height,
+                width: 1,
+                height: 1,
+            };
+            terminal_window.render_widget(
+                Paragraph::new(">").block(
+                    Block::default()
+                        .borders(Borders::NONE)
+                        .style(Style::default().bg(ratatui::style::Color::Yellow)),
+                ),
+                size,
+            );
         })?;
         Ok(())
     }
 
     // 日付が変わったかどうかをチェックし、変わっていたら予定を更新する
-    fn check_and_update_date(
+    fn check_and_update_by_date(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         calendars: &[Calendar],
     ) -> Result<bool> {
-        let jst = FixedOffset::east_opt(9 * 3600).expect("Failed to create JST offset");
-        let now_jst: DateTime<FixedOffset> = Utc::now().with_timezone(&jst);
-        let today_jst = now_jst.date_naive();
+        let now_jst: DateTime<Tz> = Utc::now().with_timezone(&Tokyo);
 
-        if today_jst != self.current_date {
-            println!("日付が変わりました: {} -> {}", self.current_date, today_jst);
-            self.current_date = today_jst;
-            self.events = Some(self.fetch_date_events(today_jst, calendars.to_vec())?);
+        if now_jst.day() != self.current_date.day() {
+            self.current_date = now_jst;
+            self.events = Some(self.fetch_date_events(now_jst, calendars.to_vec())?);
 
             App::render_ui(
                 terminal,
@@ -209,6 +192,7 @@ impl App {
                     .map(|event| EventView::from_event(event.clone()))
                     .filter_map(|event| event.ok())
                     .collect(),
+                now_jst,
             )?;
 
             return Ok(true);
@@ -247,13 +231,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(
         env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID is not defined in env"),
         env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET is not defined in env"),
+        Utc::now().with_timezone(&Tokyo),
     )?;
 
     // 表示するカレンダーのリスト
     let calendars = vec![Calendar::Primary, Calendar::Private, Calendar::University];
 
     // 初回の予定取得と表示
-    app.events = Some(app.fetch_today_events(calendars.clone())?);
+    app.events = Some(app.fetch_date_events(Utc::now().with_timezone(&Tokyo), calendars.clone())?);
 
     {
         App::render_ui(
@@ -265,6 +250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|event| EventView::from_event(event.clone()))
                 .filter_map(|event| event.ok())
                 .collect(),
+            Utc::now().with_timezone(&Tokyo),
         )?;
     }
 
@@ -306,7 +292,7 @@ fn run_app(
         let now = std::time::Instant::now();
         if now.duration_since(last_check) >= check_interval {
             // 日付が変わったかチェック
-            app.check_and_update_date(terminal, calendars)?;
+            app.check_and_update_by_date(terminal, calendars)?;
             last_check = now;
         }
     }
