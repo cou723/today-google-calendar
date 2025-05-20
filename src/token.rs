@@ -5,18 +5,13 @@ use std::net::TcpListener;
 use anyhow::Result;
 use oauth2::basic::BasicClient;
 use oauth2::url::Url;
-use oauth2::{
-    reqwest, RefreshToken,
-     RevocationUrl,
-
-};
+use oauth2::{reqwest, RefreshToken, RevocationUrl};
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     Scope, TokenResponse, TokenUrl,
 };
 
 use crate::OAuthClient;
-
 
 pub struct Token {
     pub access_token: String,
@@ -52,7 +47,9 @@ impl Token {
             let mut reader = BufReader::new(&stream);
 
             let mut request_line = String::new();
-            reader.read_line(&mut request_line).expect("failed to read request line");
+            reader
+                .read_line(&mut request_line)
+                .expect("failed to read request line");
 
             let redirect_url = request_line.split_whitespace().nth(1).unwrap();
             let url = Url::parse(&("http://localhost".to_string() + redirect_url)).unwrap();

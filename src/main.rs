@@ -5,7 +5,7 @@ use std::{env, io, time::Duration};
 
 use anyhow::Result;
 use calendar::Calendar;
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Asia::Tokyo;
 use chrono_tz::Tz;
 use event::{EventModel, EventView};
@@ -28,7 +28,8 @@ use token::Token;
 struct App {
     events: Option<Vec<EventModel>>,
     token: Token,
-    current_date: DateTime<Tz>,
+    fetched_time: DateTime<Tz>,
+    calendar_list: Vec<Calendar>,
 }
 
 type OAuthClient = oauth2::Client<
@@ -45,11 +46,17 @@ type OAuthClient = oauth2::Client<
 >;
 
 impl App {
-    fn new(client_id: String, client_secret: String, now: DateTime<Tz>) -> Result<Self> {
+    fn new(
+        client_id: String,
+        client_secret: String,
+        now: DateTime<Tz>,
+        calendar_list: Vec<Calendar>,
+    ) -> Result<Self> {
         Ok(App {
             events: None,
             token: Token::new(client_id, client_secret)?,
-            current_date: now,
+            fetched_time: now,
+            calendar_list,
         })
     }
 
@@ -64,11 +71,8 @@ impl App {
         ));
     }
 
-    fn fetch_date_events(
-        self: &Self,
-        date: DateTime<Tz>,
-        display_calendar_list: Vec<Calendar>,
-    ) -> Result<Vec<EventModel>> {
+    fn fetch_date_events(self: &mut Self, date: DateTime<Tz>) -> Result<()> {
+        self.fetched_time = date;
         let client = Client::new();
 
         let (time_min, time_max) = App::get_utc_date_range_string(date)?;
@@ -77,53 +81,87 @@ impl App {
         println!("Time Min (UTC): {}", time_min);
         println!("Time Max (UTC): {}", time_max);
 
-        Ok(display_calendar_list
-            .iter()
-            .flat_map(|calendar| -> Vec<EventModel> {
-                let url = Url::parse(
-                    format!(
-                        "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-                        calendar.id()
+        self.events = Some(
+            self.calendar_list
+                .iter()
+                .flat_map(|calendar| -> Vec<EventModel> {
+                    let url = Url::parse(
+                        format!(
+                            "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+                            calendar.id()
+                        )
+                        .as_str(),
                     )
-                    .as_str(),
-                )
-                .expect("URL should be valid");
+                    .expect("URL should be valid");
 
-                let response = client
-                    .get(url)
-                    .query(&[("timeMin", time_min.as_str())])
-                    .query(&[("timeMax", time_max.as_str())])
-                    .query(&[("orderBy", "startTime")])
-                    .query(&[("singleEvents", "true")])
-                    .query(&[("access_type", "offline")])
-                    .query(&[("prompt", "consent")])
-                    .bearer_auth(self.token.access_token.clone())
-                    .send()
-                    .expect("Request should be sent");
+                    use reqwest::StatusCode;
 
-                if !response.status().is_success() {
-                    eprintln!("Error: {:?}", response.status());
-                    panic!(
-                        "Request failed with text: {}",
-                        response.text().unwrap_or_default()
-                    );
-                }
+                    let mut response = client
+                        .get(url.clone())
+                        .query(&[("timeMin", time_min.as_str())])
+                        .query(&[("timeMax", time_max.as_str())])
+                        .query(&[("orderBy", "startTime")])
+                        .query(&[("singleEvents", "true")])
+                        .query(&[("access_type", "offline")])
+                        .query(&[("prompt", "consent")])
+                        .bearer_auth(self.token.access_token.clone())
+                        .send()
+                        .expect("Request should be sent");
 
-                let response_text = response.text().expect("Response should be text");
+                    if response.status() == StatusCode::UNAUTHORIZED {
+                        eprintln!("Access token expired or invalid. Attempting to refresh token...");
+                        match self.token.refresh() {
+                            Ok(_) => {
+                                eprintln!("Token refresh succeeded. Retrying request...");
+                                response = client
+                                    .get(url)
+                                    .query(&[("timeMin", time_min.as_str())])
+                                    .query(&[("timeMax", time_max.as_str())])
+                                    .query(&[("orderBy", "startTime")])
+                                    .query(&[("singleEvents", "true")])
+                                    .query(&[("access_type", "offline")])
+                                    .query(&[("prompt", "consent")])
+                                    .bearer_auth(self.token.access_token.clone())
+                                    .send()
+                                    .expect("Request should be sent (after refresh)");
+                                if !response.status().is_success() {
+                                    eprintln!("Request failed after token refresh: {:?}", response.status());
+                                    panic!(
+                                        "Request failed with text after refresh: {}",
+                                        response.text().unwrap_or_default()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Token refresh failed: {:?}", e);
+                                panic!("Token refresh failed: {:?}", e);
+                            }
+                        }
+                    } else if !response.status().is_success() {
+                        eprintln!("Error: {:?}", response.status());
+                        panic!(
+                            "Request failed with text: {}",
+                            response.text().unwrap_or_default()
+                        );
+                    }
 
-                let response_data =
-                    serde_json::from_str::<google_calendar3::api::Events>(response_text.as_str())
-                        .expect("Response should be deserialized");
-                response_data
-                    .items
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|event| EventModel::new(event.clone(), calendar.clone()))
-                    .collect()
-            })
-            .collect::<Vec<EventModel>>())
+                    let response_text = response.text().expect("Response should be text");
+
+                    let response_data = serde_json::from_str::<google_calendar3::api::Events>(
+                        response_text.as_str(),
+                    )
+                    .expect("Response should be deserialized");
+                    response_data
+                        .items
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|event| EventModel::new(event.clone(), calendar.clone()))
+                        .collect()
+                })
+                .collect::<Vec<EventModel>>(),
+        );
+        Ok(())
     }
-
 
     fn render_ui(
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -170,36 +208,6 @@ impl App {
         })?;
         Ok(())
     }
-
-    // 日付が変わったかどうかをチェックし、変わっていたら予定を更新する
-    fn check_and_update_by_date(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-        calendars: &[Calendar],
-    ) -> Result<bool> {
-        let now_jst: DateTime<Tz> = Utc::now().with_timezone(&Tokyo);
-
-        if now_jst.day() != self.current_date.day() {
-            self.current_date = now_jst;
-            self.events = Some(self.fetch_date_events(now_jst, calendars.to_vec())?);
-
-            App::render_ui(
-                terminal,
-                self.events
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Events are not fetched"))?
-                    .iter()
-                    .map(|event| EventView::from_event(event.clone()))
-                    .filter_map(|event| event.ok())
-                    .collect(),
-                now_jst,
-            )?;
-
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -232,13 +240,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID is not defined in env"),
         env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET is not defined in env"),
         Utc::now().with_timezone(&Tokyo),
+        vec![Calendar::Primary, Calendar::Private, Calendar::University],
     )?;
 
-    // 表示するカレンダーのリスト
-    let calendars = vec![Calendar::Primary, Calendar::Private, Calendar::University];
-
     // 初回の予定取得と表示
-    app.events = Some(app.fetch_date_events(Utc::now().with_timezone(&Tokyo), calendars.clone())?);
+    (app.fetch_date_events(Utc::now().with_timezone(&Tokyo))?);
 
     {
         App::render_ui(
@@ -255,7 +261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // エラーハンドリング付きのメインループ
-    run_app(&mut terminal, &mut app, &calendars)?;
+    run_app(&mut terminal, &mut app)?;
 
     // エラーを返す
     crossterm::terminal::disable_raw_mode()?;
@@ -271,7 +277,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    calendars: &[Calendar],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_check = std::time::Instant::now();
     let check_interval = Duration::from_secs(60); // 1分ごとにチェック
@@ -291,8 +296,27 @@ fn run_app(
         // 現在時刻を確認
         let now = std::time::Instant::now();
         if now.duration_since(last_check) >= check_interval {
-            // 日付が変わったかチェック
-            app.check_and_update_by_date(terminal, calendars)?;
+            let now_date = Utc::now().with_timezone(&Tokyo);
+
+            //30分ごとにUIを更新
+            if now_date.minute() == 0 || now_date.minute() == 30 {
+                App::render_ui(
+                    terminal,
+                    app.events
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Events are not fetched"))?
+                        .iter()
+                        .map(|event| EventView::from_event(event.clone()))
+                        .filter_map(|event| event.ok())
+                        .collect(),
+                    Utc::now().with_timezone(&Tokyo),
+                )?;
+            }
+
+            // 日付が変わった場合はeventを再取得
+            if now_date.day() != app.fetched_time.day() {
+                app.fetch_date_events(now_date)?;
+            }
             last_check = now;
         }
     }
